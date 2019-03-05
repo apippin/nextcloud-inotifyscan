@@ -4,6 +4,11 @@ import os
 import subprocess
 import sys
 import time
+import tempfile
+import json
+from pprint import pprint
+from joblib import Parallel, delayed
+import multiprocessing
 
 interval = os.environ.get('INTERVAL', 1.)
 if 'NEXTCLOUD_HOME' not in os.environ:
@@ -13,53 +18,86 @@ if 'USER_NAME' not in os.environ:
     sys.stderr.write('ERROR: USER_NAME not set\n')
     sys.exit(1)
 nextcloud_home = os.environ['NEXTCLOUD_HOME']
-user_name = os.environ['USER_NAME']
-data_prefix = nextcloud_home+'/data'
-data_prefix_len = len(data_prefix)
-scan_paths = set()
-inotifywait_proc = subprocess.Popen(['inotifywait', '--event', 'create,modify,move,delete', '--exclude', '/\.', '--recursive', data_prefix+'/'+user_name+'/files', '--quiet', '--format', '%e/%f%w/', '--monitor'], stdout=subprocess.PIPE, bufsize=0)
-inotifywait_fd = inotifywait_proc.stdout.fileno()
-inotifywait_fl = fcntl.fcntl(inotifywait_fd, fcntl.F_GETFL)
-while True:
-    event = ''
-    file_name = ''
-    file_path = ''
+    
+def inotifywait_mount(mount_point, data_prefix):
+    data_prefix_len = len(data_prefix)
+    scan_paths = set()
+    inotifywait_proc = subprocess.Popen(['inotifywait', '--event', 'create,modify,move,delete', '--exclude', '/\.', '--recursive', data_prefix, '--quiet', '--format', '%e/%f%w/', '--monitor'], stdout=subprocess.PIPE, bufsize=0)
+    inotifywait_fd = inotifywait_proc.stdout.fileno()
+    inotifywait_fl = fcntl.fcntl(inotifywait_fd, fcntl.F_GETFL)
     while True:
-        fcntl.fcntl(inotifywait_fd, fcntl.F_SETFL, inotifywait_fl|os.O_NONBLOCK)
         try:
-            c = inotifywait_proc.stdout.read(1)
-        except:
-            for p in scan_paths:
-                sys.stderr.write('Scan for %s\n' % p)
-                subprocess.call(['php', nextcloud_home+'/occ', 'files:scan', '--no-interaction', '--path='+p, '--shallow'])
-            scan_paths = set()
-            time.sleep(interval)
-            continue
-        fcntl.fcntl(inotifywait_fd, fcntl.F_SETFL, inotifywait_fl)
-        if c != '/':
-            event += c
-        else:
+            event = ''
+            file_name = ''
+            file_path = ''
             while True:
-                c = inotifywait_proc.stdout.read(1)
+                fcntl.fcntl(inotifywait_fd, fcntl.F_SETFL, inotifywait_fl|os.O_NONBLOCK)
+                try:
+                    c = inotifywait_proc.stdout.read(1)
+                except:
+                    for p in scan_paths:
+                        sys.stderr.write('Scan for %s\n' % p)
+                        subprocess.call(['php', nextcloud_home+'/occ', 'files:scan', '--no-interaction', '--path='+p, '--shallow'])
+                    scan_paths = set()
+                    time.sleep(interval)
+                    continue
+                fcntl.fcntl(inotifywait_fd, fcntl.F_SETFL, inotifywait_fl)
                 if c != '/':
-                    file_name += c
+                    event += c
                 else:
-                    lastc = ''
                     while True:
-                        lastlastc = lastc
-                        lastc = c
                         c = inotifywait_proc.stdout.read(1)
-                        if c == '\n' and lastc == '/' and lastlastc == '/':
-                            break
+                        if c != '/':
+                            file_name += c
                         else:
-                            file_path += lastc
+                            lastc = ''
+                            while True:
+                                lastlastc = lastc
+                                lastc = c
+                                c = inotifywait_proc.stdout.read(1)
+                                if c == '\n' and lastc == '/' and lastlastc == '/':
+                                    break
+                                else:
+                                    file_path += lastc
+                            break
                     break
+
+            if set(event.split(',')) & {'CREATE', 'MODIFY'}:
+                scan_path = file_path+file_name
+            else:
+                scan_path = file_path
+            if data_prefix == scan_path[:data_prefix_len]:
+                scan_path = mount_point + scan_path[data_prefix_len:]
+            sys.stderr.write('Found %s %s %s\n' % (file_path, event, file_name))
+            scan_paths |= {scan_path}
+            
+        except KeyboardInterrupt:
+            stored_exception=sys.exc_info()
             break
-    if set(event.split(',')) & {'CREATE', 'MODIFY'}:
-        scan_path = file_path+file_name
-    else:
-        scan_path = file_path
-    if data_prefix == scan_path[:data_prefix_len]:
-        scan_path = scan_path[data_prefix_len:]
-    sys.stderr.write('Found %s %s %s\n' % (file_path, event, file_name))
-    scan_paths |= {scan_path}
+
+# Get a list of mounts to watch
+fd, path = tempfile.mkstemp()
+subprocess.call(['php', nextcloud_home+'/occ', 'files_external:export','-a'], stdout=fd)
+with open(path) as f:
+    data = json.load(f)
+os.remove(path)
+
+# Add user+'/files' to the front of each external mount_point
+user_name = os.environ['USER_NAME'].split()[0]
+for mount in (data):
+    mount["mount_point"] = user_name + '/files' + mount["mount_point"]
+
+# Get each user's mount point to watch
+data_prefix = nextcloud_home+'/data'
+for user in os.environ['USER_NAME'].split():
+    user_mount = { "mount_point" : user+'/files', "configuration" : [] }
+    user_mount["configuration"] = {"datadir" : data_prefix+'/'+user+'/files'}
+    data.append(user_mount)
+
+# Call our inotify method in parallel for each mount point
+stored_exception=None
+num_cores = multiprocessing.cpu_count()
+results = Parallel(n_jobs=num_cores)(delayed(inotifywait_mount)(mount["mount_point"],mount["configuration"]["datadir"]) for mount in data)
+    
+if stored_exception:
+    raise stored_exception[0], stored_exception[1], stored_exception[2]
