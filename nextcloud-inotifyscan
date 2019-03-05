@@ -78,17 +78,19 @@ def inotifywait_mount(mount_point, data_prefix):
             stored_exception=sys.exc_info()
             break
 
-# Get a list of mounts to watch
-fd, path = tempfile.mkstemp()
-subprocess.call(['php', nextcloud_home+'/occ', 'files_external:export','-a'], stdout=fd)
-with open(path) as f:
-    data = json.load(f)
-os.remove(path)
+# Get a list of external mounts to watch
+data = list()
+if os.environ.get('WATCH_EXTERNAL_MOUNTS') == 'True':
+    fd, path = tempfile.mkstemp()
+    subprocess.call(['php', nextcloud_home+'/occ', 'files_external:export','-a'], stdout=fd)
+    with open(path) as f:
+        data = json.load(f)
+    os.remove(path)
 
-# Add user+'/files' to the front of each external mount_point
-user_name = os.environ['USER_NAME'].split()[0]
-for mount in (data):
-    mount["mount_point"] = user_name + '/files' + mount["mount_point"]
+    # Add user+'/files' to the front of each external mount_point
+    user_name = os.environ['USER_NAME'].split()[0]
+    for mount in (data):
+        mount["mount_point"] = user_name + '/files' + mount["mount_point"]
 
 # Get each user's mount point to watch
 data_prefix = nextcloud_home+'/data'
@@ -99,8 +101,11 @@ for user in os.environ['USER_NAME'].split():
 
 # Call our inotify method in parallel for each mount point
 stored_exception=None
-num_cores = multiprocessing.cpu_count()
-results = Parallel(n_jobs=num_cores)(delayed(inotifywait_mount)(mount["mount_point"],mount["configuration"]["datadir"]) for mount in data)
+if os.environ.get('NUM_PARALLEL_WORKER_JOBS'):
+    num_jobs = int(os.environ.get('NUM_PARALLEL_WORKER_JOBS'))
+else:
+    num_jobs = multiprocessing.cpu_count()
+results = Parallel(n_jobs=num_jobs)(delayed(inotifywait_mount)(mount["mount_point"],mount["configuration"]["datadir"]) for mount in data)
     
 if stored_exception:
     raise stored_exception[0], stored_exception[1], stored_exception[2]
